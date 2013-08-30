@@ -58,7 +58,7 @@ class HttpServerConnectionPipelineSpec extends Specification with RawSpecs2Pipel
           `Transfer-Encoding`("chunked"),
           `Content-Type`(`text/plain`),
           `Host`("test.com")),
-        entity = HttpEntity("body123body123"))
+        entity = HttpEntity(ContentTypes.`text/plain`, HttpData("body123") +: HttpData("body123")))
     }
 
     "dispatch Ack messages" in {
