@@ -31,13 +31,13 @@ private[io] abstract class TcpConnection(val tcp: TcpExt, val channel: SocketCha
   import tcp.bufferPool
   import TcpConnection._
 
-  private[this] var pendingWrite: PendingWrite = _
+  private[this] var pendingWrite: PendingWrite = EmptyPendingWrite
   private[this] var peerClosed = false
   private[this] var writingSuspended = false
   private[this] var interestedInResume: Option[ActorRef] = None
   var closedMessage: CloseInformation = _ // for ConnectionClosed message in postStop
 
-  def writePending = pendingWrite ne null
+  def writePending = pendingWrite ne EmptyPendingWrite
 
   // STATES
 
@@ -96,8 +96,12 @@ private[io] abstract class TcpConnection(val tcp: TcpExt, val channel: SocketCha
       doWrite(info)
       if (!writePending) // writing is now finished
         handleClose(info, closeCommander, closedEvent)
-    case SendBufferFull(remaining)          ⇒ { pendingWrite = remaining; info.registration.enableInterest(OP_WRITE) }
-    case WriteFileFinished                  ⇒ { pendingWrite = null; handleClose(info, closeCommander, closedEvent) }
+
+    case UpdatePendingWrite(remaining) ⇒
+      pendingWrite = remaining
+      if (writePending) info.registration.enableInterest(OP_WRITE)
+      else handleClose(info, closeCommander, closedEvent)
+
     case WriteFileFailed(e)                 ⇒ handleError(info.handler, e) // rethrow exception from dispatcher task
 
     case Abort                              ⇒ handleClose(info, Some(sender), Aborted)
@@ -135,11 +139,10 @@ private[io] abstract class TcpConnection(val tcp: TcpExt, val channel: SocketCha
         if (info.useResumeWriting) writingSuspended = true
 
       } else write match {
-        case Write(data, ack) if data.isEmpty ⇒
-          if (write.wantsAck) sender ! ack
-
+        case x @ Write(data, ack) if data.isEmpty ⇒
+          if (x.wantsAck) sender ! ack
         case _ ⇒
-          pendingWrite = createWrite(write)
+          pendingWrite = PendingWrite(sender, write)
           doWrite(info)
       }
 
@@ -160,9 +163,11 @@ private[io] abstract class TcpConnection(val tcp: TcpExt, val channel: SocketCha
         else sender ! CommandFailed(ResumeWriting)
       } else sender ! WritingResumed
 
-    case SendBufferFull(remaining) ⇒ { pendingWrite = remaining; info.registration.enableInterest(OP_WRITE) }
-    case WriteFileFinished         ⇒ pendingWrite = null
-    case WriteFileFailed(e)        ⇒ handleError(info.handler, e) // rethrow exception from dispatcher task
+    case UpdatePendingWrite(remaining) ⇒
+      pendingWrite = remaining
+      if (writePending) info.registration.enableInterest(OP_WRITE)
+
+    case WriteFileFailed(e) ⇒ handleError(info.handler, e) // rethrow exception from dispatcher task
   }
 
   // AUXILIARIES and IMPLEMENTATION
@@ -321,114 +326,116 @@ private[io] abstract class TcpConnection(val tcp: TcpExt, val channel: SocketCha
   override def postRestart(reason: Throwable): Unit =
     throw new IllegalStateException("Restarting not supported for connection actors.")
 
-  /** Create a pending write from a WriteCommand */
-  private[io] def createWrite(write: WriteCommand): PendingWrite = write match {
-    case write: Write ⇒
-      val buffer = bufferPool.acquire()
+  def PendingWrite(commander: ActorRef, write: WriteCommand, tail: WriteCommand = null): PendingWrite =
+    write match {
+      case null                   ⇒ EmptyPendingWrite
+      case x: Write               ⇒ PendingBufferWrite(commander, x, tail)
+      case x: WriteFile           ⇒ PendingWriteFile(commander, x, tail)
+      case CompoundWrite(head, t) ⇒ PendingWrite(commander, head, t)
+    }
 
-      try {
-        val copied = write.data.copyToBuffer(buffer)
-        buffer.flip()
-
-        PendingBufferWrite(sender, write.ack, write.data.drop(copied), buffer)
-      } catch {
-        case NonFatal(e) ⇒
-          bufferPool.release(buffer)
-          throw e
-      }
-    case write: WriteFile ⇒
-      PendingWriteFile(sender, write, new FileInputStream(write.filePath).getChannel, 0L)
+  def PendingBufferWrite(commander: ActorRef, write: Write, tail: WriteCommand): PendingBufferWrite = {
+    val buffer = bufferPool.acquire()
+    try {
+      val copied = write.data.copyToBuffer(buffer)
+      buffer.flip()
+      new PendingBufferWrite(commander, write.ack, write.data.drop(copied), buffer, tail)
+    } catch {
+      case NonFatal(e) ⇒
+        bufferPool.release(buffer)
+        throw e
+    }
   }
 
-  private[io] case class PendingBufferWrite(
-      commander: ActorRef,
+  class PendingBufferWrite(
+      val commander: ActorRef,
       ack: Any,
       remainingData: ByteString,
-      buffer: ByteBuffer) extends PendingWrite {
+      buffer: ByteBuffer,
+      tail: WriteCommand) extends PendingWrite {
 
-    def release(): Unit = bufferPool.release(buffer)
+    def hasData = buffer.hasRemaining || remainingData.nonEmpty
 
     def doWrite(info: ConnectionInfo): PendingWrite = {
       @tailrec def innerWrite(pendingWrite: PendingBufferWrite): PendingWrite = {
-        val toWrite = pendingWrite.buffer.remaining()
-        require(toWrite != 0)
-        val writtenBytes = channel.write(pendingWrite.buffer)
-        if (TraceLogging) log.debug("Wrote [{}] bytes to channel", writtenBytes)
-
-        val nextWrite = pendingWrite.consume(writtenBytes)
-
+        val nextWrite = pendingWrite.writeToChannel()
         if (pendingWrite.hasData)
-          if (writtenBytes == toWrite) innerWrite(nextWrite) // wrote complete buffer, try again now
-          else {
+          if (nextWrite ne pendingWrite) innerWrite(nextWrite) // wrote complete buffer, try again now
+          else { // try again later
             info.registration.enableInterest(OP_WRITE)
             nextWrite
-          } // try again later
-        else { // everything written
-          if (pendingWrite.wantsAck)
-            pendingWrite.commander ! pendingWrite.ack
-
-          pendingWrite.release()
-          null
-        }
+          }
+        else pendingWrite.finishHead() // everything written
       }
 
       try innerWrite(this)
       catch { case e: IOException ⇒ handleError(info.handler, e); this }
     }
-    def hasData = buffer.hasRemaining || remainingData.nonEmpty
-    def consume(writtenBytes: Int): PendingBufferWrite =
+
+    def writeToChannel(): PendingBufferWrite = {
+      val toWrite = buffer.remaining()
+      require(toWrite != 0)
+      val writtenBytes = channel.write(buffer)
+      if (TraceLogging) log.debug("Wrote [{}] bytes to channel", writtenBytes)
+
       if (buffer.hasRemaining) this
       else {
         buffer.clear()
         val copied = remainingData.copyToBuffer(buffer)
         buffer.flip()
-        copy(remainingData = remainingData.drop(copied))
+        new PendingBufferWrite(commander, ack, remainingData.drop(copied), buffer, tail)
       }
+    }
+
+    def finishHead(): PendingWrite = {
+      if (!ack.isInstanceOf[NoAck]) commander ! ack
+      release()
+      PendingWrite(commander, tail)
+    }
+
+    def release(): Unit = bufferPool.release(buffer)
   }
 
-  private[io] case class PendingWriteFile(
-      commander: ActorRef,
+  def PendingWriteFile(commander: ActorRef, write: WriteFile, tail: WriteCommand): PendingWriteFile =
+    new PendingWriteFile(commander, write, new FileInputStream(write.filePath).getChannel, tail)
+
+  class PendingWriteFile(
+      val commander: ActorRef,
       write: WriteFile,
       fileChannel: FileChannel,
-      alreadyWritten: Long) extends PendingWrite {
+      tail: WriteCommand,
+      alreadyWritten: Long = 0L) extends PendingWrite with Runnable {
 
     def doWrite(info: ConnectionInfo): PendingWrite = {
-      tcp.fileIoDispatcher.execute(writeFileRunnable(this))
+      tcp.fileIoDispatcher.execute(this)
       this
     }
 
-    def ack: Any = write.ack
+    def release(): Unit = fileChannel.close()
 
-    /** Release any open resources */
-    def release(): Unit = { fileChannel.close() }
-
-    def updatedWrite(nowWritten: Long): PendingWriteFile = {
+    def updated(nowWritten: Long): PendingWriteFile = {
       require(nowWritten < write.count)
-      copy(alreadyWritten = nowWritten)
+      new PendingWriteFile(commander, write, fileChannel, tail, nowWritten)
     }
 
     def remainingBytes = write.count - alreadyWritten
     def currentPosition = write.position + alreadyWritten
-  }
 
-  private[io] def writeFileRunnable(pendingWrite: PendingWriteFile): Runnable =
-    new Runnable {
-      def run(): Unit = try {
-        import pendingWrite._
+    def run(): Unit =
+      try {
         val toWrite = math.min(remainingBytes, tcp.Settings.TransferToLimit)
         val writtenBytes = fileChannel.transferTo(currentPosition, toWrite, channel)
 
-        if (writtenBytes < remainingBytes) self ! SendBufferFull(pendingWrite.updatedWrite(alreadyWritten + writtenBytes))
+        if (writtenBytes < remainingBytes) self ! UpdatePendingWrite(updated(alreadyWritten + writtenBytes))
         else { // finished
-          if (wantsAck) commander ! write.ack
-          self ! WriteFileFinished
-
-          pendingWrite.release()
+          if (write.wantsAck) commander ! write.ack
+          self ! UpdatePendingWrite(PendingWrite(commander, tail))
+          release()
         }
       } catch {
         case e: IOException ⇒ self ! WriteFileFailed(e)
       }
-    }
+  }
 }
 
 /**
@@ -456,22 +463,18 @@ private[io] object TcpConnection {
 
   // INTERNAL MESSAGES
 
-  /** Informs actor that no writing was possible but there is still work remaining */
-  case class SendBufferFull(remainingWrite: PendingWrite)
-  /** Informs actor that a pending file write has finished */
-  case object WriteFileFinished
-  /** Informs actor that a pending WriteFile failed */
+  case class UpdatePendingWrite(remainingWrite: PendingWrite)
   case class WriteFileFailed(e: IOException)
 
-  /** Abstraction over pending writes */
-  trait PendingWrite {
+  sealed abstract class PendingWrite {
     def commander: ActorRef
-    def ack: Any
-
-    def wantsAck = !ack.isInstanceOf[NoAck]
     def doWrite(info: ConnectionInfo): PendingWrite
+    def release(): Unit // free any occupied resources
+  }
 
-    /** Release any open resources */
-    def release(): Unit
+  object EmptyPendingWrite extends PendingWrite {
+    def commander: ActorRef = ???
+    def doWrite(info: ConnectionInfo): PendingWrite = ???
+    def release(): Unit = ???
   }
 }
