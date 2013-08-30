@@ -40,7 +40,7 @@ trait BasicMarshallers {
           val charBuffer = CharBuffer.wrap(value)
           val byteBuffer = nioCharset.encode(charBuffer)
           HttpEntity(contentType, byteBuffer.array)
-        } else EmptyEntity
+        } else HttpEntity.Empty
       }
     }
 
@@ -68,8 +68,8 @@ trait BasicMarshallers {
 
   implicit val HttpEntityMarshaller = Marshaller[HttpEntity] { (value, ctx) ⇒
     value match {
-      case EmptyEntity ⇒ ctx.marshalTo(EmptyEntity)
-      case body @ HttpBody(contentType, _) ⇒ ctx.tryAccept(contentType :: Nil) match {
+      case HttpEntity.Empty ⇒ ctx.marshalTo(HttpEntity.Empty)
+      case body @ HttpEntity.NonEmpty(contentType, _) ⇒ ctx.tryAccept(contentType :: Nil) match {
         case Some(_) ⇒ ctx.marshalTo(body) // we do NOT use the accepted CT here, since we do not want to recode
         case None    ⇒ ctx.rejectMarshalling(Seq(contentType))
       }

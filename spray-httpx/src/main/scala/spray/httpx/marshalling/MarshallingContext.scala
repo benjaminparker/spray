@@ -16,7 +16,7 @@
 
 package spray.httpx.marshalling
 
-import spray.http.{ HttpBody, ContentType, HttpEntity }
+import spray.http.{ ContentType, HttpEntity }
 import akka.actor.ActorRef
 
 trait MarshallingContext { self ⇒
@@ -67,7 +67,7 @@ trait MarshallingContext { self ⇒
       override def startChunkedMessage(entity: HttpEntity, ack: Option[Any])(implicit sender: ActorRef) =
         self.startChunkedMessage(overrideContentType(entity), ack)
       def overrideContentType(entity: HttpEntity) =
-        entity.flatMap { case HttpBody(ct, buf) ⇒ HttpEntity(contentType, buf) }
+        entity.flatMap { case HttpEntity.NonEmpty(ct, buf) ⇒ HttpEntity(contentType, buf) }
     }
 }
 
